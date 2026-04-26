@@ -1,0 +1,13 @@
+# Python venv — never commit
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# User config — contains personal MAC address, never commit
+config.json
+config.local.json
+
+# Logs / temp
+*.log
