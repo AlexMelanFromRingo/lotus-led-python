@@ -218,6 +218,15 @@ class Pkt:
         return bytearray([0x7E, 0x08, 0x05, 0x02, oid, 0x00, 0x00, 0x00, 0xEF])
 
     @staticmethod
+    def raw(data: List[int]) -> bytearray:
+        """Build a custom 9-byte packet from a list of ints.
+        Example: Pkt.raw([0x7E, 0x07, 0x05, 0x03, 255, 0, 128, 0x10, 0xEF])
+        """
+        if len(data) != 9:
+            raise ValueError(f"BLEDOM packet must be exactly 9 bytes, got {len(data)}")
+        return bytearray(data)
+
+    @staticmethod
     def parse_status(data: bytearray) -> Optional[dict]:
         """Parse FFF4 notification: 7E 08 [Power] [Mode] [Speed] [R] [G] [B] 00 EF"""
         if len(data) >= 9 and data[0] == 0x7E and data[-1] == 0xEF:
@@ -476,6 +485,29 @@ DEFAULT_CONFIG = {
             "color": [255, 200, 50],
             "flash_count": 15,
             "flash_duration_ms": 300
+        },
+        "sequence": {
+            "loop": True,
+            "steps": [
+                {"color": [255, 0, 0],   "brightness": 100, "duration": 1.0},
+                {"color": [0, 255, 0],   "duration": 1.0},
+                {"color": [0, 0, 255],   "duration": 1.0},
+                {"hw_mode": "FADE_7_COLOR", "speed": 50, "duration": 5.0}
+            ]
+        },
+        "appwatch": {
+            "check_interval": 1.0,
+            "default_color": [80, 80, 80],
+            "rules": {
+                "telegram":  {"color": [0, 136, 212], "brightness": 70},
+                "discord":   {"color": [114, 137, 218]},
+                "spotify":   {"color": [29, 185, 84]},
+                "chrome":    {"color": [66, 133, 244]},
+                "firefox":   {"color": [255, 100, 0]},
+                "code":      {"color": [0, 188, 242]},
+                "steam":     {"color": [23, 26, 33]},
+                "vlc":       {"color": [255, 165, 0]}
+            }
         }
     },
     "scenes": {
@@ -1308,6 +1340,150 @@ class NotificationMode(BaseMode):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11b ▸ SEQUENCE MODE (custom user-defined programs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SequenceMode(BaseMode):
+    """
+    User-defined sequence of LED commands executed in order.
+
+    Each step is a dict with an optional 'duration' (seconds) and one or more
+    of: color, brightness, speed, hw_mode, off, on, raw (9-byte list).
+
+    Config example:
+      "my_seq": {
+        "loop": true,
+        "steps": [
+          {"color": [255, 0, 0],       "brightness": 100, "duration": 1.0},
+          {"color": [0, 255, 0],       "duration": 1.0},
+          {"hw_mode": "FADE_7_COLOR",  "speed": 60,        "duration": 5.0},
+          {"off": true,                "duration": 2.0},
+          {"raw": [126,7,5,3,255,128,0,16,239], "duration": 0.5}
+        ]
+      }
+    """
+
+    async def _run(self):
+        steps        = self.cfg.get("steps", [])
+        loop_forever = self.cfg.get("loop", True)
+
+        if not steps:
+            _print("[yellow]Sequence mode: no steps defined in config.")
+            return
+
+        while self._running:
+            for step in steps:
+                if not self._running:
+                    break
+
+                duration = float(step.get("duration", 1.0))
+
+                if step.get("off"):
+                    await self._send(Pkt.power_off())
+                elif step.get("on"):
+                    await self._send(Pkt.power_on())
+
+                if "color" in step:
+                    r, g, b = parse_color(step["color"])
+                    await self._send(Pkt.color(r, g, b))
+                if "brightness" in step:
+                    await self._send(Pkt.brightness(int(step["brightness"])))
+                if "speed" in step and "hw_mode" not in step:
+                    await self._send(Pkt.speed(int(step["speed"])))
+                if "hw_mode" in step:
+                    try:
+                        hw  = HWMode[step["hw_mode"].upper()]
+                        spd = int(step.get("speed", 50))
+                        await self._send(Pkt.hw_mode(hw, spd))
+                    except KeyError:
+                        _print(f"[yellow]Unknown hw_mode: {step['hw_mode']}")
+                if "raw" in step:
+                    data = step["raw"]
+                    if len(data) == 9:
+                        await self._send(bytearray(data))
+                    else:
+                        _print(f"[yellow]raw step must be exactly 9 bytes, got {len(data)}")
+
+                # Hold for duration with early exit on stop
+                deadline = time.monotonic() + duration
+                while self._running and time.monotonic() < deadline:
+                    await asyncio.sleep(min(0.05, deadline - time.monotonic()))
+
+            if not loop_forever:
+                break
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11c ▸ APP-WATCH MODE (per-app foreground color rules)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AppWatchMode(BaseMode):
+    """
+    Watch the foreground application and apply per-app color rules.
+
+    Checks the active window process name every 'check_interval' seconds.
+    Falls back to default_color when no rule matches.
+
+    Config example:
+      "appwatch": {
+        "check_interval": 1.0,
+        "default_color": [80, 80, 80],
+        "rules": {
+          "telegram":  {"color": [0, 136, 212], "brightness": 70},
+          "discord":   {"color": [114, 137, 218]},
+          "spotify":   {"color": [29, 185, 84]},
+          "chrome":    {"color": [66, 133, 244]},
+          "code":      {"color": [0, 188, 242]}
+        }
+      }
+    """
+
+    async def _run(self):
+        if not HAS_PSUTIL:
+            _print("[yellow]AppWatch mode requires psutil.")
+            return
+
+        rules          = self.cfg.get("rules", {})
+        default_color  = parse_color(self.cfg.get("default_color", [80, 80, 80]))
+        check_interval = float(self.cfg.get("check_interval", 1.0))
+        last_app       = None
+
+        while self._running:
+            app_name = self._foreground_process()
+
+            if app_name != last_app:
+                last_app = app_name
+                matched  = None
+                for key, rule in rules.items():
+                    if key.lower() in app_name.lower():
+                        matched = rule
+                        break
+
+                if matched:
+                    if "brightness" in matched:
+                        await self._send(Pkt.brightness(int(matched["brightness"])))
+                    if "color" in matched:
+                        r, g, b = parse_color(matched["color"])
+                        await self._send(Pkt.color(r, g, b))
+                else:
+                    r, g, b = default_color
+                    await self._send(Pkt.color(r, g, b))
+
+            await asyncio.sleep(check_interval)
+
+    @staticmethod
+    def _foreground_process() -> str:
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            pid  = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return psutil.Process(pid.value).name()
+        except Exception:
+            return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 12 ▸ CONTEXT-AWARE MODES (GAME / VIDEO)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1462,6 +1638,9 @@ MODE_REGISTRY: Dict[str, type] = {
     "hardware":     HardwareMode,
     "mic_hw":       MicHardwareMode,
     "notification": NotificationMode,
+    "sequence":     SequenceMode,
+    "appwatch":     AppWatchMode,
+    "app_watch":    AppWatchMode,
     # Hardware mode aliases
     "jump7":        None,  # resolved below
     "fade7":        None,
@@ -1630,6 +1809,74 @@ class LotusController:
             except Exception:
                 pass
         await self.disconnect()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 14b ▸ MULTI-DEVICE GROUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LotusGroup:
+    """
+    Control multiple LED strips simultaneously.
+
+    Usage:
+        group = LotusGroup([ctrl_a, ctrl_b])
+        await group.connect_all()
+        await group.power_on()
+        await group.set_color(255, 0, 128)
+        await group.set_mode("rainbow")
+        await group.shutdown()
+
+    Target individual strips:
+        await group[0].set_color(255, 0, 0)
+        await group[1].set_color(0, 0, 255)
+    """
+
+    def __init__(self, controllers: List["LotusController"]):
+        self.controllers = list(controllers)
+
+    def __getitem__(self, idx: int) -> "LotusController":
+        return self.controllers[idx]
+
+    def __len__(self) -> int:
+        return len(self.controllers)
+
+    async def connect_all(self) -> List[bool]:
+        results = await asyncio.gather(*(c.connect() for c in self.controllers),
+                                       return_exceptions=True)
+        return [r is True for r in results]
+
+    async def _broadcast(self, coro_fn):
+        await asyncio.gather(*(coro_fn(c) for c in self.controllers),
+                             return_exceptions=True)
+
+    async def power_on(self):
+        await self._broadcast(lambda c: c.power_on())
+
+    async def power_off(self):
+        await self._broadcast(lambda c: c.power_off())
+
+    async def set_color(self, r: int, g: int, b: int):
+        await self._broadcast(lambda c: c.set_color(r, g, b))
+
+    async def set_brightness(self, level: int):
+        await self._broadcast(lambda c: c.set_brightness(level))
+
+    async def set_speed(self, level: int):
+        await self._broadcast(lambda c: c.set_speed(level))
+
+    async def set_mode(self, mode_name: str, extra_cfg: dict = None):
+        await self._broadcast(lambda c: c.set_mode(mode_name, extra_cfg))
+
+    async def apply_scene(self, scene_name: str):
+        await self._broadcast(lambda c: c.apply_scene(scene_name))
+
+    async def send_raw(self, packet: bytearray):
+        """Send a raw 9-byte packet to every strip."""
+        await self._broadcast(lambda c: c.device.send(packet))
+
+    async def shutdown(self, power_off: bool = False):
+        await self._broadcast(lambda c: c.shutdown(power_off=power_off))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
