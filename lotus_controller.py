@@ -76,12 +76,14 @@ except ImportError:
     np = None
 
 # ── Optional: audio capture ──────────────────────────────────────────────────
-try:
-    import sounddevice as sd
-    HAS_SD = True
-except ImportError:
-    HAS_SD = False
-    sd = None
+# NOTE: sounddevice calls Pa_Initialize() on import which sets COM to STA,
+# conflicting with bleak's WinRT MTA requirement. Check availability without
+# loading the library — actual import happens inside a thread executor.
+import importlib.util as _iutil
+HAS_SD = _iutil.find_spec("sounddevice") is not None
+sd = None  # loaded lazily in worker threads only
+
+import concurrent.futures as _cf
 
 try:
     import soundcard as sc_lib
@@ -893,47 +895,62 @@ class AudioMode(BaseMode):
 
         sample_rate = 44100
         chunk_size  = 2048
-        device_id   = None
+        stop_event  = threading.Event()
+        error_ref   = [None]
+        ready_event = threading.Event()
 
-        if source == "loopback":
-            device_id = self._find_loopback_device()
+        def capture_thread():
+            import sounddevice as _sd  # lazy — Pa_Initialize on worker thread only
+            device_id = None
+            if source == "loopback":
+                devices = _sd.query_devices()
+                for i, d in enumerate(devices):
+                    name = d["name"].lower()
+                    if "loopback" in name or "stereo mix" in name or "что слышит" in name:
+                        device_id = i
+                        break
+            def cb(indata, frames, time_info, status):
+                with self._buf_lock:
+                    self._audio_buf = indata[:, 0].copy()
+            kwargs = dict(samplerate=sample_rate, channels=1,
+                          blocksize=chunk_size, callback=cb)
+            if device_id is not None:
+                kwargs["device"] = device_id
+            try:
+                with _sd.InputStream(**kwargs):
+                    ready_event.set()
+                    stop_event.wait()
+            except Exception as e:
+                error_ref[0] = str(e)
+                ready_event.set()
 
         loop = asyncio.get_event_loop()
+        executor = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="audio")
+        fut = loop.run_in_executor(executor, capture_thread)
+        await asyncio.to_thread(ready_event.wait)
 
-        def audio_callback(indata, frames, time_info, status):
-            with self._buf_lock:
-                self._audio_buf = indata[:, 0].copy()
+        if error_ref[0]:
+            _print(f"[red]Audio error: {error_ref[0]}")
+            stop_event.set()
+            await asyncio.wrap_future(fut)
+            executor.shutdown(wait=False)
+            return
 
-        stream_kwargs = dict(
-            samplerate=sample_rate,
-            channels=1,
-            blocksize=chunk_size,
-            callback=audio_callback,
-        )
-        if device_id is not None:
-            stream_kwargs["device"] = device_id
-
+        _print("[green]Audio capture active.")
+        dt = 1.0 / fps
         try:
-            with sd.InputStream(**stream_kwargs):
-                dt = 1.0 / fps
-                while self._running:
-                    with self._buf_lock:
-                        buf = self._audio_buf
-                    if buf is not None and len(buf) >= chunk_size:
-                        r, g, b = self._analyze(buf, sample_rate, sensitivity,
-                                                  low_color, mid_color, high_color)
-                        await self._send(Pkt.color(r, g, b))
-                    await asyncio.sleep(dt)
-        except Exception as e:
-            _print(f"[red]Audio error: {e}")
-
-    def _find_loopback_device(self) -> Optional[int]:
-        devices = sd.query_devices()
-        for i, d in enumerate(devices):
-            name = d["name"].lower()
-            if "loopback" in name or "stereo mix" in name or "что слышит" in name:
-                return i
-        return None
+            while self._running:
+                with self._buf_lock:
+                    buf = self._audio_buf
+                if buf is not None and len(buf) >= chunk_size:
+                    r, g, b = self._analyze(buf, sample_rate, sensitivity,
+                                              low_color, mid_color, high_color)
+                    await self._send(Pkt.color(r, g, b))
+                await asyncio.sleep(dt)
+        finally:
+            stop_event.set()
+            await asyncio.wrap_future(fut)
+            executor.shutdown(wait=False)
 
     def _analyze(self, buf, sr, sensitivity, low_col, mid_col, high_col):
         window = np.hanning(len(buf))
@@ -982,42 +999,150 @@ class MusicSyncMode(BaseMode):
         beat_color  = parse_color(self.cfg.get("beat_color",  [255, 220, 0]))
         idle_color  = parse_color(self.cfg.get("idle_color",  [50, 0, 120]))
 
+        if source == "loopback":
+            await self._run_wasapi_loopback(fps, sensitivity, beat_color, idle_color)
+        else:
+            await self._run_microphone(fps, sensitivity, beat_color, idle_color)
+
+    async def _run_wasapi_loopback(self, fps, sensitivity, beat_color, idle_color):
+        """WASAPI loopback — sounddevice runs in a thread to keep COM off the asyncio thread."""
+        sample_rate = 44100
+        chunk_size  = 2048
+        dt          = 1.0 / fps
+        stop_event  = threading.Event()
+        error_ref   = [None]
+        info_ref    = [None]
+        ready_event = threading.Event()
+
+        def capture_thread():
+            import sounddevice as _sd  # lazy — Pa_Initialize on worker thread only
+
+            # Find a loopback / "Stereo Mix" capture device.
+            # Strategy: prefer devices with "loopback", "stereo mix", "stream input"
+            # or "what u hear" in name, and that have input channels.
+            loopback_idx  = None
+            loopback_name = None
+            for i, d in enumerate(_sd.query_devices()):
+                if d["max_input_channels"] < 1:
+                    continue
+                name_low = d["name"].lower()
+                if any(k in name_low for k in ("loopback", "stereo mix", "stream input",
+                                                "what u hear", "что слышит", "speakers wave",
+                                                "wave out mix")):
+                    loopback_idx  = i
+                    loopback_name = d["name"]
+                    break
+
+            if loopback_idx is None:
+                error_ref[0] = "No loopback/stereo-mix device found"
+                ready_event.set()
+                return
+
+            info_ref[0] = loopback_name
+            in_ch = min(2, int(_sd.query_devices(loopback_idx)["max_input_channels"]))
+
+            def audio_cb(indata, frames, time_info, status):
+                mono = indata.mean(axis=1) if indata.ndim > 1 else indata[:, 0]
+                with self._buf_lock:
+                    self._audio_buf = mono.copy()
+
+            try:
+                with _sd.InputStream(
+                    device=loopback_idx, samplerate=sample_rate, channels=in_ch,
+                    blocksize=chunk_size, callback=audio_cb,
+                ):
+                    ready_event.set()
+                    stop_event.wait()
+            except Exception as e:
+                error_ref[0] = str(e)
+                ready_event.set()
+
+        loop = asyncio.get_event_loop()
+        executor = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="music")
+        fut = loop.run_in_executor(executor, capture_thread)
+        await asyncio.to_thread(ready_event.wait)
+
+        if error_ref[0]:
+            _print(f"[yellow]WASAPI loopback error: {error_ref[0]}. Falling back to mic.")
+            stop_event.set()
+            await asyncio.wrap_future(fut)
+            executor.shutdown(wait=False)
+            await self._run_microphone(fps, sensitivity, beat_color, idle_color)
+            return
+
+        _print(f"[cyan]Loopback source: {info_ref[0]}")
+        _print("[green]WASAPI loopback active. Listening to system audio...")
+        try:
+            while self._running:
+                with self._buf_lock:
+                    buf = self._audio_buf
+                if buf is not None:
+                    is_beat, energy = self._detect_beat(buf, sample_rate, sensitivity)
+                    if is_beat:
+                        r, g, b = beat_color
+                    else:
+                        t       = min(1.0, energy * 2.0)
+                        r, g, b = lerp_color(idle_color, beat_color, t * 0.4)
+                    await self._send(Pkt.color(r, g, b))
+                await asyncio.sleep(dt)
+        finally:
+            stop_event.set()
+            await asyncio.wrap_future(fut)
+            executor.shutdown(wait=False)
+
+    async def _run_microphone(self, fps, sensitivity, beat_color, idle_color):
+        """Capture via default microphone — sounddevice in a thread executor."""
         sample_rate = 44100
         chunk_size  = 1024
-        device_id   = self._find_loopback_device() if source == "loopback" else None
+        dt          = 1.0 / fps
+        stop_event  = threading.Event()
+        error_ref   = [None]
+        ready_event = threading.Event()
 
-        def audio_cb(indata, frames, time_info, status):
-            with self._buf_lock:
-                self._audio_buf = indata[:, 0].copy()
+        def capture_thread():
+            import sounddevice as _sd  # lazy import on worker thread
+            def audio_cb(indata, frames, time_info, status):
+                with self._buf_lock:
+                    self._audio_buf = indata[:, 0].copy()
+            try:
+                with _sd.InputStream(samplerate=sample_rate, channels=1,
+                                     blocksize=chunk_size, callback=audio_cb):
+                    ready_event.set()
+                    stop_event.wait()
+            except Exception as e:
+                error_ref[0] = str(e)
+                ready_event.set()
 
+        loop = asyncio.get_event_loop()
+        executor = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="mic")
+        fut = loop.run_in_executor(executor, capture_thread)
+        await asyncio.to_thread(ready_event.wait)
+
+        if error_ref[0]:
+            _print(f"[red]Microphone error: {error_ref[0]}")
+            stop_event.set()
+            await asyncio.wrap_future(fut)
+            executor.shutdown(wait=False)
+            return
+
+        _print("[green]Microphone input active.")
         try:
-            stream_kwargs = dict(samplerate=sample_rate, channels=1,
-                                  blocksize=chunk_size, callback=audio_cb)
-            if device_id is not None:
-                stream_kwargs["device"] = device_id
-            with sd.InputStream(**stream_kwargs):
-                dt = 1.0 / fps
-                while self._running:
-                    with self._buf_lock:
-                        buf = self._audio_buf
-                    if buf is not None:
-                        is_beat, energy = self._detect_beat(buf, sample_rate, sensitivity)
-                        if is_beat:
-                            r, g, b = beat_color
-                        else:
-                            t       = min(1.0, energy * 2.0)
-                            r, g, b = lerp_color(idle_color, beat_color, t * 0.4)
-                        await self._send(Pkt.color(r, g, b))
-                    await asyncio.sleep(dt)
-        except Exception as e:
-            _print(f"[red]Music sync error: {e}")
-
-    def _find_loopback_device(self) -> Optional[int]:
-        devices = sd.query_devices()
-        for i, d in enumerate(devices):
-            if "loopback" in d["name"].lower() or "stereo mix" in d["name"].lower():
-                return i
-        return None
+            while self._running:
+                with self._buf_lock:
+                    buf = self._audio_buf
+                if buf is not None:
+                    is_beat, energy = self._detect_beat(buf, sample_rate, sensitivity)
+                    if is_beat:
+                        r, g, b = beat_color
+                    else:
+                        t       = min(1.0, energy * 2.0)
+                        r, g, b = lerp_color(idle_color, beat_color, t * 0.4)
+                    await self._send(Pkt.color(r, g, b))
+                await asyncio.sleep(dt)
+        finally:
+            stop_event.set()
+            await asyncio.wrap_future(fut)
+            executor.shutdown(wait=False)
 
     def _detect_beat(self, buf, sr, sensitivity) -> Tuple[bool, float]:
         fft   = np.abs(np.fft.rfft(buf))
@@ -1495,10 +1620,15 @@ class LotusController:
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
-    async def shutdown(self):
+    async def shutdown(self, power_off: bool = False):
         if self._schedule_mode:
             await self._schedule_mode.stop()
         await self.stop_mode()
+        if power_off:
+            try:
+                await self.power_off()
+            except Exception:
+                pass
         await self.disconnect()
 
 
@@ -1795,7 +1925,9 @@ async def cli_main(args: argparse.Namespace, cfg: dict):
             await interactive_tui(ctrl)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        _print("\n[yellow]Interrupted.")
+        _print("\n[yellow]Interrupted. Turning off LEDs...")
+        await ctrl.shutdown(power_off=True)
+        return
     finally:
         await ctrl.shutdown()
 
