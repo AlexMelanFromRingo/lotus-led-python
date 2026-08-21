@@ -52,6 +52,19 @@ def test_default_scenes_name_real_modes():
         assert mode in MODE_REGISTRY or hw_mode_from_name(mode), f"scene '{name}' -> '{mode}'"
 
 
+def test_animation_names_in_the_config_resolve():
+    """The config spells animations the canonical way.
+
+    Rust used to serialise `Strobe7Color` as `strobe7_color`, which nothing
+    else accepts — a config written by one implementation would then fail to
+    load in the other.
+    """
+    assert hw_mode_from_name(DEFAULT_CONFIG["modes"]["hardware"]["mode"]) is not None
+    for step in DEFAULT_CONFIG["modes"]["sequence"]["steps"]:
+        if step.get("hw_mode"):
+            assert hw_mode_from_name(step["hw_mode"]) is not None, step
+
+
 def test_ramp_modes_have_their_own_sensible_durations():
     """They share a shape but not a purpose: a sunset as long as a sunrise is
     a chore, and a sleep timer needs to outlast both."""
