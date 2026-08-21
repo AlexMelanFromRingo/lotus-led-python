@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lotus-led"
+version = "3.0.0"
+description = "Control BLEDOM / ELK-BLEDOM / Lotus Lantern LED strips over Bluetooth LE"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["ble", "bluetooth", "led", "bledom", "rgb", "ambilight"]
+dependencies = ["bleak>=0.21.0"]
+
+[project.optional-dependencies]
+audio = ["numpy>=1.24.0", "soundcard>=0.4.2", "sounddevice>=0.4.6"]
+ambient = ["mss>=9.0.1", "numpy>=1.24.0"]
+system = ["psutil>=5.9.0", "pywin32>=306; sys_platform == 'win32'"]
+full = [
+    "numpy>=1.24.0", "soundcard>=0.4.2", "sounddevice>=0.4.6",
+    "mss>=9.0.1", "psutil>=5.9.0", "pywin32>=306; sys_platform == 'win32'",
+]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+led = "lotus_led.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/AlexMelanFromRingo/lotus-led-python"
+Protocol = "https://github.com/AlexMelanFromRingo/BLEDOM-Protocol-Reversing"
+
+[tool.setuptools]
+packages = ["lotus_led"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

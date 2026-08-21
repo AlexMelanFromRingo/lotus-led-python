@@ -1,64 +1,44 @@
 @echo off
-setlocal enabledelayedexpansion
-
-:: Always work from the directory this script lives in
+setlocal
 cd /d "%~dp0"
 
 echo ============================================================
-echo   Lotus LED Controller - Windows Setup
-echo   Working dir: %CD%
+echo   Lotus LED - Windows setup
+echo   %CD%
 echo ============================================================
 
-:: Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Python not found in PATH. Install Python 3.10+ from python.org
+    echo [ERROR] Python is not on PATH. Install Python 3.10+ from python.org
+    echo         and tick "Add python.exe to PATH" during setup.
     pause
     exit /b 1
 )
 
-for /f "delims=" %%i in ('python --version 2^>^&1') do set PYVER=%%i
-echo [OK] Found %PYVER%
+for /f "delims=" %%i in ('python --version 2^>^&1') do echo [ok] %%i
 
-:: Create venv
-echo.
-echo Creating virtual environment...
 if exist venv\ (
-    echo [SKIP] venv already exists. Delete it to reinstall.
+    echo [skip] venv already exists - delete the folder to start over
 ) else (
-    python -m venv venv
-    if errorlevel 1 (
-        echo [ERROR] Failed to create venv.
-        pause
-        exit /b 1
-    )
-    echo [OK] venv created at %CD%\venv
+    echo Creating virtual environment...
+    python -m venv venv || (echo [ERROR] could not create venv & pause & exit /b 1)
 )
 
-:: Upgrade pip
-echo.
-echo Upgrading pip...
+echo Installing...
 venv\Scripts\python.exe -m pip install --upgrade pip -q
-
-:: Install requirements
-echo.
-echo Installing packages...
-venv\Scripts\pip.exe install -r requirements.txt
-
+venv\Scripts\pip.exe install -e ".[full,dev]"
 if errorlevel 1 (
     echo.
-    echo [WARN] Some optional packages failed to install.
-    echo        Core (bleak) required; others enable extra modes.
+    echo [warn] Some optional packages failed. bleak is the only hard requirement;
+    echo        the rest add audio, ambilight and system-monitor modes.
 )
 
 echo.
 echo ============================================================
-echo   Setup complete!
-echo   Run:  run.bat --help
-echo         run.bat scan
-echo         run.bat on
-echo         run.bat mode rainbow
-echo         run.bat mode audio
-echo         run.bat mode ambient
+echo   Done. Try:
+echo     run.bat scan
+echo     run.bat color ff8800
+echo     run.bat mode music
+echo     run.bat modes
 echo ============================================================
 pause

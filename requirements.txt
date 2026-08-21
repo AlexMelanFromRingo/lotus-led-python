@@ -1,8 +1,16 @@
+# Required
 bleak>=0.21.0
+
+# Audio-reactive modes (audio, music)
 numpy>=1.24.0
-sounddevice>=0.4.6
+soundcard>=0.4.2      # real WASAPI loopback on Windows — the system-audio path
+sounddevice>=0.4.6    # microphone, and monitor inputs on Linux/macOS
+
+# Ambilight
 mss>=9.0.1
+
+# System monitor, game/video/app detection
 psutil>=5.9.0
-rich>=13.7.0
-pywin32>=306
-soundcard>=0.4.2
+
+# Foreground-window detection (Windows only)
+pywin32>=306; sys_platform == "win32"
