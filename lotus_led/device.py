@@ -38,7 +38,24 @@ from .protocol import (
 log = logging.getLogger("lotus.device")
 
 _MIN_INTERVAL = 1.0 / MAX_PACKETS_PER_SEC
-_RECONNECT_COOLDOWN = 3.0
+
+#: Wait this long between reconnect attempts. Without it, a 20 fps mode turns an
+#: unplugged strip into twenty connection attempts a second.
+_RECONNECT_INTERVAL = 1.5
+
+#: Give up after this many attempts in a row. Retrying forever leaves a UI
+#: claiming to be connected to a strip that is switched off.
+_RECONNECT_ATTEMPTS = 4
+
+#: What the user is told when the link is gone.
+#:
+#: Deliberately free of platform error codes — they name nothing the user can
+#: act on, and the remedy is the same whatever the code. The underlying error
+#: still goes to the log.
+LINK_LOST = (
+    "The strip stopped responding. These controllers drop the link at range — "
+    "move closer, then connect again."
+)
 
 
 @dataclass
@@ -122,6 +139,7 @@ class BLEDOMDevice:
         self._lock = asyncio.Lock()
         self._last_send = 0.0
         self._last_reconnect = 0.0
+        self._reconnect_failures = 0
         self._state = ShadowState()
         self._listeners: List[Callable[[ShadowState], None]] = []
 
@@ -226,10 +244,11 @@ class BLEDOMDevice:
     # ── Sending ──────────────────────────────────────────────────────────────
 
     async def send(self, packet: bytearray) -> None:
-        """Send one frame, rate-limited, with a single reconnect-and-retry.
+        """Send one frame, rate-limited, reconnecting if the link has dropped.
 
-        These controllers drop the link on their own at the edge of range; a
-        mode that has been running for hours should recover rather than die.
+        The lock serialises callers, so only one recovery runs at a time. These
+        controllers drop the link on their own at the edge of range, and a mode
+        that has been running for hours should recover rather than die.
         """
         async with self._lock:
             gap = _MIN_INTERVAL - (time.monotonic() - self._last_send)
@@ -239,11 +258,19 @@ class BLEDOMDevice:
             try:
                 await self._write(packet)
                 self._last_send = time.monotonic()
+                self._reconnect_failures = 0
                 return
             except Exception as first:  # noqa: BLE001
                 self._last_send = time.monotonic()
-                await self._reconnect(first)
+
+            await self._recover(first)
+            try:
                 await self._write(packet)
+                self._reconnect_failures = 0
+            except Exception as exc:  # noqa: BLE001
+                log.warning("write failed again after reconnecting: %s", exc)
+                raise RuntimeError(LINK_LOST) from exc
+            finally:
                 self._last_send = time.monotonic()
 
     async def _write(self, packet: bytearray) -> None:
@@ -251,36 +278,53 @@ class BLEDOMDevice:
             raise RuntimeError("not connected")
         await self._client.write_gatt_char(WRITE_UUID, packet, response=False)
 
-    async def _reconnect(self, cause: Exception) -> None:
-        """Re-establish the link, at most once every few seconds.
+    async def _recover(self, cause: Exception) -> None:
+        """Try to get the link back, pacing attempts and giving up eventually.
 
-        The cool-down matters: without it, a strip that has been unplugged turns
-        every frame of a 20 fps mode into a full connection attempt.
+        ``cause`` is logged rather than shown: platform BLE errors are opaque
+        codes, and every one of them means the same thing here.
         """
-        if time.monotonic() - self._last_reconnect < _RECONNECT_COOLDOWN:
-            raise RuntimeError(f"link is down: {cause}")
+        if self._reconnect_failures >= _RECONNECT_ATTEMPTS:
+            raise RuntimeError(LINK_LOST) from cause
+
+        since = time.monotonic() - self._last_reconnect
+        if since < _RECONNECT_INTERVAL:
+            await asyncio.sleep(_RECONNECT_INTERVAL - since)
         self._last_reconnect = time.monotonic()
 
-        log.warning("link dropped (%s) — reconnecting to %s", cause, self.address)
-        await self.disconnect()
-        client = BleakClient(self.address, timeout=15.0)
-        await client.connect()
-        self._client = client
+        log.warning(
+            "link to %s dropped (%s) — reconnecting, attempt %d/%d",
+            self.address, cause, self._reconnect_failures + 1, _RECONNECT_ATTEMPTS,
+        )
 
-        # The strip forgets everything on a power cycle, so restore what we
-        # believe it should be showing.
-        if self._state.known:
-            try:
-                await self._write(Pkt.power(self._state.power))
-                await self._write(Pkt.brightness(self._state.brightness))
-                if self._state.hw_mode is not None:
-                    await self._write(Pkt.speed(self._state.speed))
-                    await self._write(Pkt.hw_mode(self._state.hw_mode))
-                else:
-                    await self._write(Pkt.color(self._state.r, self._state.g, self._state.b))
-            except Exception:  # noqa: BLE001 - restoring is best-effort
-                log.debug("could not restore state after reconnect", exc_info=True)
+        try:
+            await self.disconnect()
+            client = BleakClient(self.address, timeout=15.0)
+            await client.connect()
+            self._client = client
+            await self._restore_state()
+        except Exception as exc:  # noqa: BLE001
+            self._reconnect_failures += 1
+            log.warning("reconnect failed: %s", exc)
+            raise RuntimeError(LINK_LOST) from exc
+
+        self._reconnect_failures = 0
         log.info("reconnected")
+
+    async def _restore_state(self) -> None:
+        """Push our shadow state back, since the strip forgets on a power cycle."""
+        if not self._state.known:
+            return
+        try:
+            await self._write(Pkt.power(self._state.power))
+            await self._write(Pkt.brightness(self._state.brightness))
+            if self._state.hw_mode is not None:
+                await self._write(Pkt.speed(self._state.speed))
+                await self._write(Pkt.hw_mode(self._state.hw_mode))
+            else:
+                await self._write(Pkt.color(self._state.r, self._state.g, self._state.b))
+        except Exception:  # noqa: BLE001 - restoring is best-effort
+            log.debug("could not restore state after reconnect", exc_info=True)
 
     # ── Commands ─────────────────────────────────────────────────────────────
 

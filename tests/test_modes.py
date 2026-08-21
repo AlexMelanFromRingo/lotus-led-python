@@ -228,3 +228,14 @@ def test_near_black_is_clamped_to_black():
 def test_grading_a_grey_leaves_it_grey():
     r, g, b = _grade((128, 128, 128), 2.0, 1.0, 8)
     assert r == g == b
+
+
+def test_the_link_lost_message_is_actionable_and_free_of_error_codes():
+    """Platform BLE errors are opaque codes the user cannot act on, and every
+    one of them means the same thing here. The message must say what to do,
+    not what the OS called it."""
+    from lotus_led.device import LINK_LOST
+
+    for noise in ("HRESULT", "Error {", "code:", "0x8"):
+        assert noise not in LINK_LOST, f"leaks {noise!r}: {LINK_LOST}"
+    assert "connect again" in LINK_LOST
