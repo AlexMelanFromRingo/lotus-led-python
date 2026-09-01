@@ -102,10 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
     white_p.add_argument("warm", type=int)
     white_p.add_argument("cold", type=int)
 
-    pin_p = sub.add_parser("pin-order", help="fix swapped colours by remapping driver pins")
-    pin_p.add_argument("r", type=int)
-    pin_p.add_argument("g", type=int)
-    pin_p.add_argument("b", type=int)
+    pin_p = sub.add_parser(
+        "pin-order",
+        help="say what each driver pin is wired to: 1 red, 2 green, 3 blue, in "
+             "pin order (1 2 3 is the factory wiring)",
+    )
+    pin_p.add_argument("pin1", type=int, help="colour of pin 1")
+    pin_p.add_argument("pin2", type=int, help="colour of pin 2")
+    pin_p.add_argument("pin3", type=int, help="colour of pin 3")
 
     mic_p = sub.add_parser("mic", help="control the strip's own microphone")
     mic_p.add_argument("state", nargs="?", default="on", help="on or off")
@@ -372,9 +376,12 @@ async def run_command(args: argparse.Namespace, cfg: Dict[str, Any], path) -> in
             await dev.set_cct(min(args.warm, 100), min(args.cold, 100))
 
         elif command == "pin-order":
-            await dev.set_pin_order(args.r, args.g, args.b)
-            print(f"Pin order set to R={args.r} G={args.g} B={args.b}.")
-            print(f'Add "pin_order": [{args.r}, {args.g}, {args.b}] under "device" to keep it.')
+            pins = (args.pin1, args.pin2, args.pin3)
+            await dev.set_pin_order(*pins)
+            names = {1: "red", 2: "green", 3: "blue"}
+            said = ", ".join(f"pin {i} {names.get(c, '?')}" for i, c in enumerate(pins, 1))
+            print(f"Pin order set: {said}.")
+            print(f'Add "pin_order": [{pins[0]}, {pins[1]}, {pins[2]}] under "device" to keep it.')
 
         elif command == "mic":
             if args.state.lower() in ("on", "true", "1", "enable"):

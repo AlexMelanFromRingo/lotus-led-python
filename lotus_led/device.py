@@ -382,8 +382,9 @@ class BLEDOMDevice:
     async def set_mic_eq(self, eq: MicEq) -> None:
         await self.send(Pkt.mic_eq(eq))
 
-    async def set_pin_order(self, r: int, g: int, b: int) -> None:
-        await self.send(Pkt.pin_order(r, g, b))
+    async def set_pin_order(self, pin1: int, pin2: int, pin3: int) -> None:
+        """What each driver pin is wired to: 1 red, 2 green, 3 blue."""
+        await self.send(Pkt.pin_order(pin1, pin2, pin3))
 
 
 class DeviceGroup:

@@ -333,15 +333,22 @@ class Pkt:
     # -- wiring --------------------------------------------------------------
 
     @staticmethod
-    def pin_order(r: int, g: int, b: int) -> bytearray:
-        """``7E 06 81 <r> <g> <b> FF 00 EF``
+    def pin_order(pin1: int, pin2: int, pin3: int) -> bytearray:
+        """``7E 06 81 <pin1> <pin2> <pin3> FF 00 EF``
 
-        Each argument is the physical channel (1-3) driving that colour;
-        factory default is ``(1, 2, 3)``. Use it when red and green come out
-        swapped.
+        Argument *n* is the colour pin *n* drives -- ``1`` red, ``2`` green,
+        ``3`` blue -- and the factory default is ``(1, 2, 3)``. The controller
+        keeps it in flash, so it outlives both the program and the power.
+
+        The direction is easy to invert: this says "pin 1 is red", not "red
+        comes out of pin 1". Both readings agree on the factory order and on
+        any swap of two colours, and disagree on the two rotations -- so
+        getting it backwards looks correct until it meets a strip wired in a
+        cycle. ``PinSequenceActivity`` in the vendor app settles it: one
+        indicator per pin, stored as ``rgbTypeInColumn[column] = colour``.
         """
-        return bytearray([FRAME_HEAD, 0x06, 0x81, _clamp(r, 1, 3), _clamp(g, 1, 3),
-                          _clamp(b, 1, 3), 0xFF, 0x00, FRAME_TAIL])
+        return bytearray([FRAME_HEAD, 0x06, 0x81, _clamp(pin1, 1, 3), _clamp(pin2, 1, 3),
+                          _clamp(pin3, 1, 3), 0xFF, 0x00, FRAME_TAIL])
 
     # -- laser-projector units ----------------------------------------------
 
